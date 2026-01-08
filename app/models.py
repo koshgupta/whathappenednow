@@ -39,4 +39,4 @@ class Prediction(SQLModel, table=True):
     model_version: str = Field(index=True)
     prob_up: float
     prob_down: float
-    created_at: datetime = Field(default_factory=datetime.now(datetime.timezone.utc), index=True)
+    created_at: datetime = Field(default_factory=datetime.now(), index=True)
