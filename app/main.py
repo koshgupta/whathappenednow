@@ -19,36 +19,3 @@ async def lifespan(app: FastAPI):
     yield
     # Place for shutdown code if needed
 
-@app.post("/assets", response_model=Asset)
-def create_asset(asset: Asset, session: Session = Depends(get_session)):
-    # Enforce unique symbol at app level (SQLite unique constraint also helps)
-    existing = session.exec(select(Asset).where(Asset.symbol == asset.symbol)).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Symbol already exists")
-
-    session.add(asset)
-    session.commit()
-    session.refresh(asset)
-    return asset
-
-@app.get("/assets", response_model=List[Asset])
-def list_assets(session: Session = Depends(get_session)):
-    return session.exec(select(Asset).order_by(Asset.symbol)).all()
-
-@app.post("/news", response_model=NewsItem)
-def ingest_news(item: NewsItem, session: Session = Depends(get_session)):
-    # Basic dedupe by URL if provided
-    if item.url:
-        existing = session.exec(select(NewsItem).where(NewsItem.url == item.url)).first()
-        if existing:
-            return existing
-
-    session.add(item)
-    session.commit()
-    session.refresh(item)
-    return item
-
-@app.get("/news/{symbol}", response_model=List[NewsItem])
-def get_news(symbol: str, session: Session = Depends(get_session)):
-    stmt = select(NewsItem).where(NewsItem.symbol == symbol.upper()).order_by(NewsItem.published_at.desc())
-    return session.exec(stmt).all()

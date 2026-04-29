@@ -1,0 +1,12 @@
+[project]
+name = "whathappenednow"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dotenv>=0.9.9",
+    "newsapi-python>=0.2.7",
+    "pandas>=2.3.3",
+    "requests>=2.32.5",
+]
