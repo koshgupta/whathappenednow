@@ -6,9 +6,8 @@ Tier 1 : FinBERT (ProsusAI/finbert) — HF Serverless API
           excluded from Tier 2, but FinBERT probs still averaged into daily base features.
 Tier 2 : Qwen3.5-27B — HF Dedicated Endpoint (auto-created and torn down per run)
           Scores non-neutral articles for sector relevance, novelty, and subjectivity.
-Tier 3 : Qwen3-Embedding — local CPU via sentence-transformers
+Tier 3 : Qwen3-Embedding — LM Studio instance (Mac) via /v1/embeddings
           Embeds ALL articles; per-day mean vectors reduced via PCA to 5 context features.
-          Loaded once at startup. Expect ~10-20 articles/sec on a modern desktop CPU.
 
 Checkpoint : data/article_scores_checkpoint.parquet — flushed after every batch so the
              run can be interrupted and resumed without re-calling the API.
@@ -51,9 +50,7 @@ _PROJ_ROOT = Path(__file__).resolve().parent.parent
 # Model identifiers
 # ---------------------------------------------------------------------------
 FINBERT_MODEL = "ProsusAI/finbert"
-TIER2_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-# Smaller Qwen3-Embedding variants (e.g. Qwen/Qwen3-Embedding-0.6B) cut API cost
-# at some loss of semantic richness. Adjust to match what's available on HF serverless.
+TIER2_MODEL = "qwen2.5-7b-instruct@q4_k_m"
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 # ---------------------------------------------------------------------------
@@ -61,7 +58,7 @@ EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 # ---------------------------------------------------------------------------
 NEUTRAL_THRESHOLD = 0.90  # P(Neutral) above this → skip Tier 2
 BATCH_SIZE = 256          # unique texts per delta checkpoint file / progress log
-TIER2_WORKERS = 8         # concurrent Tier 2 calls per batch. Real ceiling is the
+TIER2_WORKERS = 4         # concurrent Tier 2 calls per batch. Real ceiling is the
                           # dedicated endpoint's TGI max_batch_size; raising past it
                           # just queues server-side without further speedup.
 PCA_COMPONENTS = 5
@@ -69,22 +66,10 @@ BUZZ_WINDOW = 10          # trading days for buzz_factor rolling denominator
 EWMA_SPAN = 5             # span for sentiment_ewma_5d
 
 # ---------------------------------------------------------------------------
-# Dedicated endpoint hardware (vLLM container)
-# Qwen2.5-7B in bf16 needs ~14 GB for weights plus vLLM KV cache overhead
-# (~20 GB peak under concurrent batching). Adjust instance_type / instance_size
-# to match current HF Dedicated Endpoint offerings for your cloud vendor.
+# LM Studio Local Instance (for Tier 2) — adjust these if using a different hosting strategy or model
 # ---------------------------------------------------------------------------
-ENDPOINT_NAME = "whn-qwen-tier2"
-ENDPOINT_VENDOR = "aws"
-ENDPOINT_REGION = "us-east-1"
-ENDPOINT_ACCELERATOR = "gpu"
-ENDPOINT_INSTANCE_TYPE = "nvidia-l40s"
-ENDPOINT_INSTANCE_SIZE = "x1"   # single instance
 
-# vLLM container image for HF Dedicated Endpoints.
-# MAX_MODEL_LEN caps the KV cache budget; raise if you need longer contexts.
-VLLM_IMAGE_URL = "philschmi/vllm-hf-inference-endpoints"
-VLLM_MAX_MODEL_LEN = "8192"
+LM_STUDIO_BASE_URL="http://100.93.64.114:1234/v1"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -263,23 +248,28 @@ def _parse_tier2_response(raw: str) -> dict | None:
     return None
 
 
-def _score_tier2(text: str, client: InferenceClient) -> dict | None:
+def _score_tier2(text: str, client: str) -> dict | None:
     """
     Returns {"relevance", "novelty", "subjectivity"} or None on parse/API failure.
     None causes this article to be excluded from Tier 2 daily aggregation.
     Its FinBERT scores are still included in the base daily means.
     """
     def _call():
-        resp = client.chat_completion(
-            model=TIER2_MODEL,
-            messages=[
-                {"role": "system", "content": _TIER2_SYSTEM},
-                {"role": "user", "content": f"Article: {text}"},
-            ],
-            max_tokens=128,
-            temperature=0.0,
+        resp = requests.post(
+            url="http://100.93.64.114:1234/v1/chat/completions",
+            json={
+                "model": "qwen2.5-7b-instruct-mlx@8bit",
+                "messages": [
+                    {"role": "system", "content": _TIER2_SYSTEM},
+                    {"role": "user", "content": f"Article: {text}"},
+                ],
+                "max_tokens": 128,
+                "temperature": 0.0,
+            },
+            timeout=120,
         )
-        return resp.choices[0].message.content
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
     try:
         raw = _retry(_call)
@@ -292,11 +282,19 @@ def _score_tier2(text: str, client: InferenceClient) -> dict | None:
         log.warning("Tier 2 JSON parse failed. Raw: %.200s", raw)
         return None
 
+    def _get(d: dict, exact: str, prefix: str):
+        if exact in d:
+            return float(d[exact])
+        fallback = next((v for k, v in d.items() if k.startswith(prefix)), None)
+        if fallback is not None:
+            return float(fallback)
+        raise KeyError(exact)
+
     try:
         return {
-            "relevance": float(parsed["relevance"]),
-            "novelty": float(parsed["novelty"]),
-            "subjectivity": float(parsed["subjectivity"]),
+            "relevance": _get(parsed, "relevance", "rel"),
+            "novelty": _get(parsed, "novelty", "nov"),
+            "subjectivity": _get(parsed, "subjectivity", "sub"),
         }
     except (KeyError, TypeError, ValueError) as exc:
         log.warning("Tier 2 field extraction failed (%s). Parsed: %s", exc, parsed)
@@ -304,15 +302,10 @@ def _score_tier2(text: str, client: InferenceClient) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Tier 3: Qwen3-Embedding (local CPU)
+# Tier 3: Qwen3-Embedding (LM Studio on Mac)
 # ---------------------------------------------------------------------------
 
 def _load_embedding_model(model_id: str = EMBEDDING_MODEL) -> SentenceTransformer:
-    """
-    Loads the embedding model into CPU memory. ~1.2 GB on disk in fp16, ~2.5 GB in
-    fp32 RAM. First call downloads from HF Hub if not cached; subsequent calls reuse
-    the local cache at ~/.cache/huggingface.
-    """
     log.info("Loading embedding model %s on CPU (first run downloads ~1.2 GB)...", model_id)
     model = SentenceTransformer(model_id, device="cpu")
     log.info("Embedding model loaded.")
@@ -322,10 +315,6 @@ def _load_embedding_model(model_id: str = EMBEDDING_MODEL) -> SentenceTransforme
 def _embed_batch(texts: list, model: SentenceTransformer) -> np.ndarray:
     """
     Returns float32 array of shape (n, embedding_dim) in the same order as `texts`.
-
-    Runs locally on CPU — no HTTP, no retries. PyTorch releases the GIL during the
-    forward pass so this still overlaps cleanly with the network-bound Tier 2 calls
-    in the surrounding ThreadPoolExecutor.
     """
     embeddings = model.encode(
         texts,
@@ -334,70 +323,6 @@ def _embed_batch(texts: list, model: SentenceTransformer) -> np.ndarray:
     ).astype(np.float32)
     log.info("Embedding: %d texts → shape %s, dim=%d", len(texts), embeddings.shape, embeddings.shape[1])
     return embeddings
-
-
-# ---------------------------------------------------------------------------
-# Dedicated endpoint lifecycle
-# ---------------------------------------------------------------------------
-
-def _create_tier2_endpoint(api: HfApi):
-    """
-    Returns a running Qwen3.5-9B dedicated endpoint, creating one if needed.
-
-    If an endpoint named ENDPOINT_NAME already exists (e.g. from a previous run that
-    crashed before teardown), it is reused when running, waited on when initializing,
-    or deleted and recreated when in a terminal-failed or paused state.
-    """
-    try:
-        endpoint = api.get_inference_endpoint(ENDPOINT_NAME)
-        status = endpoint.status
-        if status == "running":
-            log.info("Reusing existing endpoint '%s' (status: running).", ENDPOINT_NAME)
-            return endpoint
-        elif status in ("initializing", "pending", "updating"):
-            log.info(
-                "Endpoint '%s' already exists (status: %s). Waiting for it to be ready...",
-                ENDPOINT_NAME, status,
-            )
-            endpoint.wait()
-            log.info("Endpoint ready: %s", endpoint.url)
-            return endpoint
-        else:
-            log.warning(
-                "Endpoint '%s' exists but is in state '%s'. Deleting and recreating...",
-                ENDPOINT_NAME, status,
-            )
-            endpoint.delete()
-    except HfHubHTTPError as exc:
-        if exc.response.status_code != 404:
-            raise
-        # 404 — endpoint does not exist yet; fall through to create it
-
-    log.info("Creating dedicated endpoint '%s' for %s ...", ENDPOINT_NAME, TIER2_MODEL)
-    endpoint = api.create_inference_endpoint(
-        name=ENDPOINT_NAME,
-        repository=TIER2_MODEL,
-        framework="pytorch",
-        task="custom",
-        accelerator=ENDPOINT_ACCELERATOR,
-        vendor=ENDPOINT_VENDOR,
-        region=ENDPOINT_REGION,
-        type="protected",
-        instance_size=ENDPOINT_INSTANCE_SIZE,
-        instance_type=ENDPOINT_INSTANCE_TYPE,
-        min_replica=1,
-        max_replica=1,
-        custom_image={
-            "health_route": "/health",
-            "env": {"MAX_MODEL_LEN": VLLM_MAX_MODEL_LEN},
-            "url": VLLM_IMAGE_URL,
-        },
-    )
-    log.info("Waiting for endpoint to start (typically 3–5 min)...")
-    endpoint.wait()
-    log.info("Endpoint ready: %s", endpoint.url)
-    return endpoint
-
 
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
@@ -443,7 +368,7 @@ def _consolidate_checkpoint(
 def score_articles(
     df: pd.DataFrame,
     hf_token: str,
-    tier2_client: InferenceClient,
+    tier2_client: str,
     embed_model: SentenceTransformer,
     checkpoint_path: Path,
     checkpoint_dir: Path,
@@ -529,7 +454,7 @@ def score_articles(
             # which articles get sent to the dedicated endpoint).
             fb_scores = _score_finbert_batch(texts, hf_token)
 
-            # Tier 2 + Tier 3 run concurrently — Tier 2 is network-bound (vLLM endpoint),
+            # Tier 2 + Tier 3 run concurrently — Tier 2 is network-bound (LM Studio),
             # embed is CPU-bound (local PyTorch, releases GIL during forward pass), so
             # they overlap without contending. TIER2_WORKERS threads issue parallel Tier 2
             # requests; +1 worker handles the embedding call.
@@ -744,30 +669,16 @@ def run_sentiment_pipeline(
         "%d articles across %d trading days.", len(df_news), df_news["Date"].nunique()
     )
 
-    api = HfApi(token=HF_TOKEN)
-
-    endpoint = _create_tier2_endpoint(api)
-    tier2_client = InferenceClient(base_url=endpoint.url, token=HF_TOKEN)
     embed_model = _load_embedding_model()
 
-    try:
-        df_scored = score_articles(
-            df=df_news,
-            hf_token=HF_TOKEN,
-            tier2_client=tier2_client,
-            embed_model=embed_model,
-            checkpoint_path=checkpoint_path,
-            checkpoint_dir=checkpoint_dir,
-        )
-    finally:
-        log.info("Tearing down endpoint '%s'...", ENDPOINT_NAME)
-        try:
-            endpoint.delete()
-            log.info("Endpoint deleted.")
-        except Exception as exc:
-            log.warning(
-                "Endpoint delete failed: %s. Delete it manually at hf.co/endpoints.", exc
-            )
+    df_scored = score_articles(
+        df=df_news,
+        hf_token=HF_TOKEN,
+        tier2_client=LM_STUDIO_BASE_URL,
+        embed_model=embed_model,
+        checkpoint_path=checkpoint_path,
+        checkpoint_dir=checkpoint_dir,
+    )
 
     log.info("Aggregating %d scored articles into daily rows...", len(df_scored))
     df_daily = _aggregate_daily(df_scored)
