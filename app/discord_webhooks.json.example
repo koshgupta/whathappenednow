@@ -1,0 +1,16 @@
+{
+  "forecast_channels": [
+    {
+      "label": "personal-server",
+      "url": "https://discord.com/api/webhooks/REPLACE_WITH_REAL_WEBHOOK_ID/REPLACE_WITH_REAL_WEBHOOK_TOKEN"
+    },
+    {
+      "label": "team-server",
+      "url": "https://discord.com/api/webhooks/REPLACE_WITH_REAL_WEBHOOK_ID/REPLACE_WITH_REAL_WEBHOOK_TOKEN"
+    }
+  ],
+  "error_channel": {
+    "label": "ops-alerts",
+    "url": "https://discord.com/api/webhooks/REPLACE_WITH_REAL_WEBHOOK_ID/REPLACE_WITH_REAL_WEBHOOK_TOKEN"
+  }
+}

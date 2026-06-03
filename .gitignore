@@ -1,6 +1,11 @@
 .venv/
 .env
+__pycache__/
+*.pyc
 data/
 .DS_Store
 CLAUDE.md
 .claude/
+app/discord_webhooks.json
+CLAUDE.md
+old/

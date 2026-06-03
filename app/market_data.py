@@ -2,7 +2,7 @@
 ES continuous futures feature pipeline for S&P 500 intraday direction prediction.
 
 Prediction point : 9:00 AM ET — after 8:30 AM macro noise settles, before cash open.
-Target           : buffered binary — 1 if RTH close (4 PM) > RTH open (9:30 AM) * 1.0002.
+Target           : binary — 1 if RTH close (4 PM) > RTH open (9:30 AM), else 0.
 Anti-lookahead   : daily technical indicators are shifted forward by 1 trading day so
                    each 9 AM row only sees values knowable from yesterday's close.
                    Target uses the exact 9:30 AM open (09:30 bar) and 4 PM close
@@ -38,19 +38,30 @@ PRICE_FACTOR = 1e9
 # 1. DATA FETCH
 # ---------------------------------------------------------------------------
 
-def fetch_es_futures() -> pd.DataFrame:
-    """Fetch 5 years of ES continuous futures 1 min bars from Databento and cache locally."""
+def _client() -> db.Historical:
     api_key = os.getenv("DATABENTO_API_KEY")
     if not api_key:
         raise EnvironmentError("DATABENTO_API_KEY not set in environment")
+    return db.Historical(key=api_key)
 
+
+def _normalize_databento_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply standard cleanup: UTC tz, fixed-point → float, OHLCV columns, sorted."""
+    df.index = pd.to_datetime(df.index, utc=True)
+    for col in ("open", "high", "low", "close"):
+        if col in df.columns and df[col].dtype == np.int64:
+            df[col] = df[col] / PRICE_FACTOR
+    return df[["open", "high", "low", "close", "volume"]].sort_index()
+
+
+def fetch_es_futures() -> pd.DataFrame:
+    """Full 6-yr fetch of ES continuous futures 1 min bars (cold-start path)."""
     end = datetime.now() - timedelta(days=1)
     start = end - relativedelta(years=LOOKBACK_YEARS + 1)
 
     print(f"Fetching {SYMBOL} ({SCHEMA}) from {start.date()} to {end.date()} via Databento (6 yr for SMA-200 warm-up, ~3M bars expected)...")
 
-    client = db.Historical(key=api_key)
-    data = client.timeseries.get_range(
+    data = _client().timeseries.get_range(
         dataset=DATASET,
         symbols=[SYMBOL],
         schema=SCHEMA,
@@ -59,21 +70,61 @@ def fetch_es_futures() -> pd.DataFrame:
         stype_in="continuous",
     )
 
-    df = data.to_df()
-    df.index = pd.to_datetime(df.index, utc=True)
-
-    # Databento returns prices as int64 fixed-point; convert to float if needed
-    for col in ("open", "high", "low", "close"):
-        if col in df.columns and df[col].dtype == np.int64:
-            df[col] = df[col] / PRICE_FACTOR
-
-    df = df[["open", "high", "low", "close", "volume"]].sort_index()
-
+    df = _normalize_databento_df(data.to_df())
     os.makedirs(os.path.dirname(RAW_PATH), exist_ok=True)
     df.to_parquet(RAW_PATH, engine="pyarrow")
     print(f"  {len(df):,} bars saved → {RAW_PATH}")
-
     return df
+
+
+def update_es_cache_incremental() -> pd.DataFrame:
+    """Extend the local 1m bar cache to ~now via IB Gateway.
+
+    Strategy: if the cache exists, detect its maximum UTC timestamp and request
+    only `(cache_max + 1 minute) → utcnow()` from IB Gateway. Concat,
+    defensive-dedupe, write. Falls back to the full Databento fetch if no cache
+    yet — the historical 5 yr base stays on Databento; IB only fills the
+    rolling daily delta. See ib_client.py for the connection contract.
+
+    The end is `utcnow()` rather than `now() - 1 day` so a Saturday/Sunday run
+    captures Friday's full RTH close (the 15:59 ET bar). IB returns only what
+    has printed; querying past the published end is a no-op.
+    """
+    if not os.path.exists(RAW_PATH):
+        return fetch_es_futures()
+
+    cache = pd.read_parquet(RAW_PATH)
+    if cache.index.tz is None:
+        cache.index = cache.index.tz_localize("UTC")
+
+    cache_max = cache.index.max()
+    end = pd.Timestamp.utcnow()
+    start = cache_max + pd.Timedelta(minutes=1)
+
+    if start >= end:
+        print(f"Cache already current (max {cache_max}); no incremental fetch.")
+        return cache
+
+    print(f"Cache max {cache_max}; fetching incremental via IB: {start} → {end}...")
+    # Local import to avoid pulling ib_async on cold-start paths that only need
+    # Databento (e.g. running fetch_es_futures() on a fresh machine without IB).
+    from ib_client import fetch_continuous_bars_sync
+
+    new = fetch_continuous_bars_sync("ES", start, end)
+    if len(new) == 0:
+        print("No new bars returned by IB.")
+        return cache
+
+    combined = pd.concat([cache, new]).sort_index()
+    n_dup = int(combined.index.duplicated().sum())
+    if n_dup:
+        print(f"  removing {n_dup} duplicate timestamps after append.")
+        combined = combined[~combined.index.duplicated(keep="first")]
+
+    combined.to_parquet(RAW_PATH, engine="pyarrow")
+    added = len(combined) - len(cache)
+    print(f"  cached {len(combined):,} bars (+{added:,}; range {combined.index.min()} → {combined.index.max()}) → {RAW_PATH}")
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +275,29 @@ def build_daily_technicals(df_1m: pd.DataFrame) -> pd.DataFrame:
     ]
     out = daily[[c for c in feature_cols if c in daily.columns]].copy()
 
-    # ANTI-LOOKAHEAD: each row now holds the indicator values from the prior trading day's close
+    # Append today's ET date as a NaN placeholder row so the subsequent shift(1)
+    # populates it with yesterday's (the previous row's) RTH-derived indicators.
+    # Without this, today's row never enters df_tech because the daily resample
+    # is keyed on RTH dates and today has no RTH bars yet at 9 AM. The
+    # downstream join in build_feature_matrix would then leave today's
+    # daily-technical columns as NaN, and the keep_unsettled=True path would
+    # drop today's row entirely — breaking same-day prediction.
+    #
+    # Historical rows (D-1 and earlier) are unaffected: shift(1) still maps
+    # each historical row's value to the next row's position exactly as
+    # before. The change is purely additive — it captures D-1's values that
+    # the original shift would have discarded (no row to shift them onto).
+    today_et = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
+    if today_et not in out.index:
+        nan_row = pd.DataFrame(
+            {c: [np.nan] for c in out.columns},
+            index=pd.DatetimeIndex([today_et]),
+        )
+        out = pd.concat([out, nan_row]).sort_index()
+
+    # ANTI-LOOKAHEAD: each row now holds the indicator values from the prior
+    # trading day's close. Today's row picks up yesterday's values via the
+    # appended-NaN-then-shift trick above.
     out = out.shift(1)
 
     return out
@@ -302,9 +375,9 @@ def build_premarket_features(df_1m: pd.DataFrame) -> pd.DataFrame:
 
 def build_target(df_1m: pd.DataFrame) -> pd.Series:
     """
-    Buffered binary target:
-        y = 1  if  close_4pm > open_930am * 1.0002
-        y = 0  otherwise  (flat or down, including small up moves ≤ 0.02 %)
+    Binary target:
+        y = 1  if  close_4pm > open_930am
+        y = 0  otherwise
 
     With 1 min bars both prices are exact discrete bar boundaries — no proxy needed.
     close_4pm  = close of the 15:59 bar (left-labeled, ends at 16:00 ET).
@@ -312,7 +385,7 @@ def build_target(df_1m: pd.DataFrame) -> pd.Series:
     Neither value is available at the 9:00 AM prediction point; both are only used
     to label historical rows during training.
     """
-    print("Building buffered binary target...")
+    print("Building binary target (no buffer)...")
 
     df_et = _to_et(df_1m)
 
@@ -329,7 +402,7 @@ def build_target(df_1m: pd.DataFrame) -> pd.Series:
     )
 
     y = pd.Series(
-        np.where(aligned["close_4pm"] > aligned["open_930am"] * 1.0002, 1, 0),
+        np.where(aligned["close_4pm"] > aligned["open_930am"], 1, 0),
         index=aligned.index,
         name="y",
         dtype=np.int8,
@@ -341,11 +414,20 @@ def build_target(df_1m: pd.DataFrame) -> pd.Series:
 # 4. MAIN PIPELINE
 # ---------------------------------------------------------------------------
 
-def build_feature_matrix(df_1m: pd.DataFrame) -> pd.DataFrame:
+def build_feature_matrix(df_1m: pd.DataFrame, keep_unsettled: bool = False) -> pd.DataFrame:
     """
     Merge pre-market features, shifted daily technicals, and target into a
     single Date-indexed DataFrame of 9:00 AM snapshots ready for XGBoost.
     No raw OHLC prices are included in the output.
+
+    keep_unsettled
+    --------------
+    False (default): drop any row with NaN in any feature OR the target. This
+                     is the standard training-data behaviour.
+    True           : keep rows whose only NaN is the target (`y`) — needed by
+                     daily_fetch.py to score today's 9 AM snapshot before
+                     today's RTH close is known. Feature-side NaN still drops
+                     the row, because predicting on partial features is unsafe.
     """
     print("\nBuilding feature matrix...")
 
@@ -359,30 +441,23 @@ def build_feature_matrix(df_1m: pd.DataFrame) -> pd.DataFrame:
     cutoff = pd.Timestamp(datetime.now() - relativedelta(years=LOOKBACK_YEARS)).normalize()
     df = df[df.index >= cutoff]
 
-    df.dropna(inplace=True)
+    if keep_unsettled:
+        feature_cols = [c for c in df.columns if c != "y"]
+        df = df.dropna(subset=feature_cols)
+    else:
+        df.dropna(inplace=True)
     df.index.name = "date"
 
     os.makedirs(os.path.dirname(FEATURES_PATH), exist_ok=True)
     df.to_parquet(FEATURES_PATH, engine="pyarrow")
 
+    n_unsettled = int(df["y"].isna().sum()) if keep_unsettled else 0
     print(f"\n  {len(df):,} trading days | {df.shape[1]} columns → {FEATURES_PATH}")
     print(f"  Features : {[c for c in df.columns if c != 'y']}")
-    print(f"  Target   : {df['y'].mean():.1%} up days (y=1)")
+    settled = df["y"].dropna()
+    if len(settled):
+        print(f"  Target   : {settled.mean():.1%} up days (y=1) over {len(settled)} labelled rows")
+    if n_unsettled:
+        print(f"  Unsettled (no y yet) rows kept: {n_unsettled}")
 
     return df
-
-
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    if os.path.exists(RAW_PATH):
-        print(f"Loading cached raw data from {RAW_PATH}...")
-        df_1m = pd.read_parquet(RAW_PATH)
-        if df_1m.index.tz is None:
-            df_1m.index = df_1m.index.tz_localize("UTC")
-    else:
-        df_1m = fetch_es_futures()
-
-    build_feature_matrix(df_1m)

@@ -223,14 +223,156 @@ def align_and_prepare_news(
 
     return df
 
-if __name__ == "__main__":    
-    # --- Usage Example ---
-    df_ready_for_nlp = align_and_prepare_news(
-        input_parquet_path="/mnt/storage/data/code/whathappenednow/data/sp500_news.parquet",
-        output_parquet_path="/mnt/storage/data/code/whathappenednow/data/aligned_premarket_news.parquet",
-        date_col="published_at" # Change this if your Mediastack column is named differently
+def fetch_news_incremental(
+    api_key: str,
+    raw_path: str = os.path.join(_PROJ_ROOT, "data", "sp500_news.parquet"),
+    aligned_path: str = os.path.join(_PROJ_ROOT, "data", "aligned_premarket_news.parquet"),
+) -> pd.DataFrame:
+    """
+    Daily-incremental news fetch from Mediastack.
+
+    Reads the existing raw parquet, detects the most recent published_at date,
+    fetches only the missing days through "today", appends + deduplicates,
+    then regenerates the aligned premarket parquet. No-op when the cache is
+    already current.
+
+    Uses the same per-day pagination strategy as fetch_sp500_news_history to
+    stay under Mediastack's 10k-per-query cap and 5-page-per-day envelope.
+    """
+    BASE_URL = "http://api.mediastack.com/v1/news"
+    COUNTRY_LIST = 'us,cn,sa,ca'
+    CATEGORY_LIST = 'business,technology,health'
+    MAX_PAGES_PER_DAY = 5
+    LIMIT = 100
+
+    end_date = pd.Timestamp(datetime.now()).normalize()
+    if not os.path.exists(raw_path):
+        raise FileNotFoundError(
+            f"News cache missing at {raw_path}. fetch_news_incremental refuses "
+            "to trigger a 5-year cold-start refetch — run "
+            "fetch_sp500_news_history() once to prime the cache."
+        )
+    existing = pd.read_parquet(raw_path)
+    existing["published_at"] = pd.to_datetime(existing["published_at"])
+    last_seen = existing["published_at"].max()
+    if pd.isna(last_seen):
+        raise ValueError(
+            f"News cache at {raw_path} has no valid published_at timestamps — "
+            "the file appears corrupt. Investigate before triggering a refetch."
+        )
+    # Re-fetch the last seen day so any articles that arrived after our previous
+    # cutoff but on the same date are caught. Dedup happens post-concat.
+    # last_seen is tz-aware (Mediastack returns UTC); end_date is tz-naive.
+    # Drop tz before comparing — we only care about calendar date here.
+    start_ts = pd.Timestamp(last_seen)
+    if start_ts.tzinfo is not None:
+        start_ts = start_ts.tz_convert("UTC").tz_localize(None)
+    start_date = start_ts.normalize()
+
+    if start_date > end_date:
+        print(f"News cache already current through {start_date.date()}.")
+        return existing
+
+    date_ranges = pd.date_range(start=start_date, end=end_date, freq='D')
+    print(
+        f"📡 Incremental news fetch: {start_date.date()} → {end_date.date()} "
+        f"({len(date_ranges)} day(s))"
     )
-    # fetch_sp500_news_history(
-    #     api_key=NEWS_API_KEY,
-    #     years=5,
-    #     save_path=os.path.join(_PROJ_ROOT, "data", "sp500_news.parquet"))
+
+    new_articles: list[dict] = []
+    # Track dates whose fetch was interrupted by an error so we can hard-fail
+    # at the end instead of silently writing a parquet with missing days. If
+    # any day fails, we discard the entire fetch — next run repeats the full
+    # window (Mediastack dedupes via (title, published_at) on the next save,
+    # so the previously-successful days aren't double-billed against quota).
+    failed_dates: list[tuple[str, str]] = []
+    for current_date in date_ranges:
+        date_str = current_date.strftime('%Y-%m-%d')
+        day_count = 0
+        day_error: str | None = None
+        for page in range(MAX_PAGES_PER_DAY):
+            params = {
+                'access_key': api_key,
+                'categories': CATEGORY_LIST,
+                'countries': COUNTRY_LIST,
+                'languages': 'en',
+                'date': date_str,
+                'limit': LIMIT,
+                'offset': page * LIMIT,
+                'sort': 'published_desc',
+            }
+            try:
+                response = requests.get(BASE_URL, params=params, timeout=15)
+                if response.status_code == 429:
+                    print("⚠️ Rate limit reached. Waiting 10 seconds...")
+                    time.sleep(10)
+                    response = requests.get(BASE_URL, params=params, timeout=15)
+                if response.status_code != 200:
+                    day_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                    print(f"❌ API Error on {date_str}: {day_error}")
+                    break
+                data = response.json()
+                articles = data.get('data', [])
+                if not articles:
+                    break
+                new_articles.extend(articles)
+                day_count += len(articles)
+                pagination = data.get('pagination', {})
+                total_found = pagination.get('total', 0)
+                if (page + 1) * LIMIT >= total_found:
+                    break
+                time.sleep(0.15)
+            except requests.exceptions.RequestException as e:
+                day_error = f"connection error: {e}"
+                print(f"⚠️ {date_str}: {day_error}")
+                break
+        if day_error:
+            failed_dates.append((date_str, day_error))
+        print(f"✅ {date_str}: {day_count} articles | Session total: {len(new_articles)}")
+
+    # Hard-fail if any day's fetch was interrupted. Do this BEFORE the parquet
+    # write so we don't silently advance last_seen past a missing day — which
+    # would prevent next run from retrying the gap.
+    if failed_dates:
+        summary = "; ".join(f"{d}: {err}" for d, err in failed_dates)
+        raise RuntimeError(
+            f"News fetch failed for {len(failed_dates)}/{len(date_ranges)} date(s) — "
+            f"NOT writing partial cache so next run retries the full window. "
+            f"Failures: {summary}"
+        )
+
+    if not new_articles:
+        # Defensive: every day succeeded but Mediastack returned zero articles
+        # across the entire window. Unlikely on a healthy day; raise so the
+        # operator investigates (could be a misconfigured API key, an account
+        # quota exhaustion that returns 200-with-empty-body, etc.).
+        if existing.empty:
+            raise RuntimeError(
+                "No news articles retrieved on incremental fetch and no existing cache. "
+                "Verify NEWS_API_KEY and Mediastack plan quota."
+            )
+        print("⚠️ No new articles retrieved; existing cache unchanged.")
+        combined = existing
+    else:
+        new_df = pd.DataFrame(new_articles)
+        new_df["published_at"] = pd.to_datetime(new_df["published_at"])
+        combined = pd.concat([existing, new_df], ignore_index=True)
+
+    combined = (
+        combined.drop_duplicates(subset=["title", "published_at"], keep="last")
+        .sort_values("published_at")
+        .reset_index(drop=True)
+    )
+    added = len(combined) - len(existing)
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    combined.to_parquet(raw_path, compression="snappy", index=False)
+    print(f"🚀 News cache: {len(combined):,} articles (+{added:,}) → {raw_path}")
+
+    # Always refresh the aligned parquet so downstream sentiment scoring sees
+    # the new rows. align_and_prepare_news is a pure re-derivation and cheap.
+    align_and_prepare_news(
+        input_parquet_path=raw_path,
+        output_parquet_path=aligned_path,
+        date_col="published_at",
+    )
+    return combined

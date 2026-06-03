@@ -31,6 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import logging
 import joblib
 import numpy as np
 import pandas as pd
@@ -46,6 +47,8 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent
 
+log = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
@@ -56,9 +59,9 @@ EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 # ---------------------------------------------------------------------------
 # Tunable parameters
 # ---------------------------------------------------------------------------
-NEUTRAL_THRESHOLD = 0.90  # P(Neutral) above this → skip Tier 2
+NEUTRAL_THRESHOLD = 0.80  # P(Neutral) above this → skip Tier 2
 BATCH_SIZE = 256          # unique texts per delta checkpoint file / progress log
-TIER2_WORKERS = 4         # concurrent Tier 2 calls per batch. Real ceiling is the
+TIER2_WORKERS = 1         # concurrent Tier 2 calls per batch. Real ceiling is the
                           # dedicated endpoint's TGI max_batch_size; raising past it
                           # just queues server-side without further speedup.
 PCA_COMPONENTS = 5
@@ -69,7 +72,9 @@ EWMA_SPAN = 5             # span for sentiment_ewma_5d
 # LM Studio Local Instance (for Tier 2) — adjust these if using a different hosting strategy or model
 # ---------------------------------------------------------------------------
 
-LM_STUDIO_BASE_URL="http://100.93.64.114:1234/v1"
+LM_STUDIO_BASE_URL = os.getenv(
+    "LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1/chat/completions"
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -84,16 +89,89 @@ OUTPUT_PATH = _PROJ_ROOT / "data" / "sentiment_features.parquet"
 # Tier 2 prompt
 # ---------------------------------------------------------------------------
 _TIER2_SYSTEM = (
-    "You are a financial news analyst. Given a financial news article, assess its potential "
-    "impact on broad equity markets and return ONLY a valid JSON object with exactly these "
-    "three keys:\n"
-    '  "relevance": float 0.1-1.0  '
-    "(0.1 = single-stock ticker, 0.5 = sector-wide, 1.0 = global macro/index-wide)\n"
-    '  "novelty": float 0.1-1.0  '
-    "(0.1 = routine update/old news, 1.0 = breaking event/black swan)\n"
-    '  "subjectivity": float 0.1-1.0  '
-    "(0.1 = opinion/rumor, 1.0 = hard fact/government data/SEC filing)\n"
-    "Return ONLY the JSON object. No preamble, no explanation, no markdown."
+    "You are a financial news scoring engine calibrated to evaluate news in relation to "
+    "the S&P 500 index. Your sole function is to analyze a given news headline and "
+    "description and return a structured JSON score across three independent metrics: "
+    "relevance, novelty, and subjectivity. You do not summarize, explain, or comment. "
+    "You only return the JSON object.\n"
+    "---\n\n"
+    "SCORING METRICS\n\n"
+    "1. RELEVANCE (float, 0.10–1.00)\n"
+    "Measures how broadly impactful the news is to the S&P 500 as a whole index. This is "
+    "not about directional sentiment (bullish or bearish) — only the scope of index-level impact.\n\n"
+    "Calibration scale:\n"
+    "- 0.10 = Affects a single stock or niche asset with no meaningful index-level read-through. "
+    "Example: A small-cap biotech announces a Phase 2 trial result.\n"
+    "- 0.30 = Affects a sub-sector or a handful of companies. Example: A regional bank reports "
+    "earnings misses, raising concerns about community lending.\n"
+    "- 0.50 = Sector-wide impact with moderate index relevance. Example: OPEC announces a "
+    "production cut affecting the entire energy sector.\n"
+    "- 0.70 = Multi-sector or large-cap impact that moves index composition meaningfully. "
+    "Example: Apple, Microsoft, and Alphabet all issue cautious forward guidance in the same week.\n"
+    "- 0.90 = Domestic macro event with near-certain index-wide implications. Example: The U.S. "
+    "Federal Reserve unexpectedly raises interest rates by 75bps.\n"
+    "- 1.00 = Global macro or systemic event with direct, broad S&P 500 impact. Examples: The "
+    "2008 Lehman Brothers collapse; the March 2020 COVID-19 market circuit breakers; the 9/11 "
+    "attacks triggering a week-long market closure.\n\n"
+    "Note: Subjectivity and relevance are considered together. Highly speculative or opinion-based "
+    "news about a single stock or narrow topic should receive a correspondingly low relevance score, "
+    "as unverified information rarely has index-level impact.\n"
+    "---\n\n"
+    "2. NOVELTY (float, 0.10–1.00)\n"
+    "Measures how new, surprising, or market-moving the information is relative to what was "
+    "already known or priced in. Novelty is scored independently of relevance and subjectivity. "
+    "Important: If a current article is reporting on or referencing a past event (even a major one), "
+    "novelty should reflect the age of the underlying information, not the recency of the article "
+    "itself. A new article rehashing a known event scores low on novelty.\n\n"
+    "Calibration scale:\n"
+    "- 0.10 = Routine, expected, or recycled information. Example: A quarterly earnings report that "
+    "met analyst consensus exactly, or an article summarizing the 2008 financial crisis for context.\n"
+    "- 0.25 = Minor update to an ongoing known story. Example: A follow-up article noting that "
+    "merger talks, already widely reported, are still ongoing.\n"
+    "- 0.40 = Moderate new development within an anticipated trend. Example: CPI comes in slightly "
+    "above expectations but within the range analysts had forecasted.\n"
+    "- 0.60 = Noteworthy surprise with clear market implications. Example: A major retailer "
+    "unexpectedly announces the closure of 200 stores with no prior warning.\n"
+    "- 0.80 = High-impact breaking news not previously anticipated. Example: A sitting Fed Chair "
+    "unexpectedly resigns; a major sovereign debt downgrade is announced without prior signals.\n"
+    "- 1.00 = Black swan or completely unprecedented event. Examples: The September 11 2001 attacks; "
+    "the March 2020 WHO pandemic declaration; the 1987 Black Monday crash.\n"
+    "---\n\n"
+    "3. SUBJECTIVITY (float, 0.10–1.00)\n"
+    "Measures how factually grounded the information is. Higher scores indicate harder, more "
+    "verifiable data. Lower scores indicate opinion, rumor, speculation, or unverified claims.\n\n"
+    "Calibration scale:\n"
+    "- 0.10 = Pure opinion, rumor, social media speculation, or unattributed claim. Example: A tweet "
+    "from an anonymous account claiming a major tech company is about to be acquired.\n"
+    "- 0.25 = Analyst opinion or soft commentary from a named source. Example: A Goldman Sachs "
+    "strategist publishes a note saying they believe the market is overvalued.\n"
+    "- 0.40 = Reported speculation with some sourcing. Example: A news outlet reports, citing "
+    "unnamed sources, that merger discussions are underway.\n"
+    "- 0.60 = Named-source reporting or official statements not yet formally filed. Example: A CFO "
+    "makes forward-looking comments on an earnings call.\n"
+    "- 0.80 = Verified institutional data or formally reported figures. Example: The Bureau of Labor "
+    "Statistics releases monthly non-farm payroll numbers.\n"
+    "- 1.00 = Hard, immutable fact from an authoritative primary source. Examples: An SEC 8-K filing "
+    "disclosing a material event; a Federal Reserve FOMC rate decision statement; a U.S. Treasury "
+    "official debt ceiling announcement.\n"
+    "---\n\n"
+    "INPUT FORMAT\n"
+    "You will receive a news item consisting of a headline and a short description as raw text.\n\n"
+    "OUTPUT FORMAT\n"
+    "Return only a valid JSON object with exactly three keys. No markdown. No explanation. "
+    "No extra text before or after the JSON.\n\n"
+    "{\n"
+    '  "relevance": <float between 0.10 and 1.00, max 2 decimal places>,\n'
+    '  "novelty": <float between 0.10 and 1.00, max 2 decimal places>,\n'
+    '  "subjectivity": <float between 0.10 and 1.00, max 2 decimal places>\n'
+    "}\n\n"
+    "CONSTRAINTS\n"
+    "- All values must be between 0.10 and 1.00 inclusive.\n"
+    "- All values must be expressed as floats with a maximum of 2 decimal places (e.g. 0.74, not 0.7 or 0.742).\n"
+    "- Do not include any text, explanation, or markdown outside the JSON object.\n"
+    "- Novelty must be scored based on the freshness of the underlying information, not the publication date of the article.\n"
+    "- Relevance must reflect index-level impact scope only — do not factor in bullish or bearish directional sentiment.\n"
+    "- When content is highly subjective (rumor, tweet, speculation), weight relevance downward accordingly, as unverified information is unlikely to carry meaningful index-wide impact."
 )
 
 logging.basicConfig(
@@ -256,9 +334,9 @@ def _score_tier2(text: str, client: str) -> dict | None:
     """
     def _call():
         resp = requests.post(
-            url="http://100.93.64.114:1234/v1/chat/completions",
+            url=client,
             json={
-                "model": "qwen2.5-7b-instruct-mlx@8bit",
+                "model": "qwen3.5-4b-instruct-pure",
                 "messages": [
                     {"role": "system", "content": _TIER2_SYSTEM},
                     {"role": "user", "content": f"Article: {text}"},
