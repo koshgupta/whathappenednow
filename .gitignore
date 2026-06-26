@@ -9,3 +9,5 @@ CLAUDE.md
 app/discord_webhooks.json
 CLAUDE.md
 old/
+run_daily.sh
+logs/

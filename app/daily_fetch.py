@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -265,6 +266,15 @@ def _backfill_news_and_sentiment() -> None:
     sentiment_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sentiment_mod)
     sentiment_mod.run_sentiment_pipeline()
+
+    # Drop the sentiment module and force a collection before the pipeline
+    # moves on to feature rebuild + the Optuna retrain (step 5). The embedding
+    # model frees itself inside run_sentiment_pipeline, but releasing the
+    # module object here too guarantees nothing keeps the ~2-3 GB transformer
+    # resident alongside the retrain — the combination is what tripped the OOM
+    # killer when the host was also running a Minecraft server.
+    del sentiment_mod, spec
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------

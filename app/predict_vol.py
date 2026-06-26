@@ -412,11 +412,19 @@ def fit_final(mode: str, X_tv: pd.DataFrame, y_tv: pd.Series, search_params: dic
 # ---------------------------------------------------------------------------
 
 def _metrics(y_true: pd.Series, pred: np.ndarray) -> dict:
+    abs_err = np.abs(np.asarray(y_true, dtype=float) - np.asarray(pred, dtype=float))
+    mae = float(abs_err.mean())
+    # Empirical coverage of the ±MAE band: fraction of points whose absolute
+    # error falls within one MAE. This is the honest "confidence" the forecast
+    # embed reports for its `pred ± MAE` band — derived from the same held-out
+    # errors as the MAE itself, so band width and coverage stay consistent.
+    coverage_at_mae = float((abs_err <= mae).mean()) if len(abs_err) else float("nan")
     return {
         "rmse": float(np.sqrt(mean_squared_error(y_true, pred))),
-        "mae": float(mean_absolute_error(y_true, pred)),
+        "mae": mae,
         "r2": float(r2_score(y_true, pred)),
         "pred_std": float(np.std(pred)),
+        "coverage_at_mae": coverage_at_mae,
     }
 
 

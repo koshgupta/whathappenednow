@@ -20,6 +20,7 @@ Input  : data/aligned_premarket_news.parquet  (Date, published_at, news_text)
 Output : data/sentiment_features.parquet      (one row per trading day, join on Date)
 """
 
+import gc
 import hashlib
 import json
 import logging
@@ -779,6 +780,15 @@ def run_sentiment_pipeline(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_daily.to_parquet(output_path, index=False)
     log.info("Saved %d daily sentiment rows to %s", len(df_daily), output_path)
+
+    # Release the SentenceTransformer (~2-3 GB resident on CPU) and the large
+    # article frames before returning, so they aren't still in RAM when the
+    # caller moves on to the Optuna retrain. On a memory-constrained box (e.g.
+    # sharing the host with a Minecraft server) keeping both resident at once
+    # is enough to trip the kernel OOM-killer mid-run.
+    del embed_model, df_scored, df_news
+    gc.collect()
+
     return df_daily
 
 

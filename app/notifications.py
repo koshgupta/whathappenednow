@@ -329,17 +329,26 @@ def build_forecast_embed(
     # ~0.003 (30 bps) on the May 2026 numbers; fall back to that constant if
     # the meta has no test_metrics yet (first cold-start run).
     mae = 0.003
+    coverage = None
     try:
-        mae = float(model_meta["test_metrics"]["model"]["mae"])
+        model_metrics = model_meta["test_metrics"]["model"]
+        mae = float(model_metrics["mae"])
+        cov = model_metrics.get("coverage_at_mae")
+        if cov is not None and not pd.isna(cov):
+            coverage = float(cov)
     except (KeyError, TypeError, ValueError):
         pass
     low_bps = max(0.0, (predicted_range - mae) * 10000)
     high_bps = (predicted_range + mae) * 10000
 
+    # Coverage is the empirically-measured hit-rate of the ±MAE band on the
+    # held-out test set (see predict_vol._metrics). Omit the percentage if an
+    # older cache predates the metric rather than printing a stale constant.
+    conf_suffix = f" (~{coverage * 100:.0f}% confidence)" if coverage is not None else ""
     description = (
         f"**Predicted range:** {predicted_bps_str} ({predicted_pct_str})\n"
         f"**Read:** {band_name} day expected\n"
-        f"Likely range: {low_bps:.0f}–{high_bps:.0f} bps (~64% confidence)"
+        f"Likely range: {low_bps:.0f}–{high_bps:.0f} bps{conf_suffix}"
     )
 
     fields: list[dict] = []
